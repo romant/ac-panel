@@ -4,6 +4,8 @@ The wall-bus protocol between a **Temperzone TZT-100** thermostat and the **UC8*
 controller it is wired to, reverse-engineered by passive observation — plus a tested reference
 implementation of the thermostat side.
 
+As referenced and walked through in the [blog post](https://www.romant.net/2026/08/temperzone-automation-four-wires-a-cold-room-and-an-esp32/).
+
 There is no public documentation for this protocol. This repository is the description, the raw
 captures it was derived from, the instrument used to take them, and about 300 lines of C++ that
 answers the unit controller convincingly enough to run an air conditioner.
