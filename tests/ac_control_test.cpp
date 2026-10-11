@@ -11,6 +11,8 @@ static constexpr float COLD = 15.0f, HOT = 30.0f, SP = 22.0f;
 // A fresh controller starts LOCKED OUT (comp_off_at = 0 reads as "stopped at t=0"), so tests
 // that are not about the lockout begin past it.
 static constexpr uint32_t T0 = ANTI_CYCLE_MS + 1000;
+// A fresh controller's valve sits in the cool position, and a start waits for the valve. Tests that
+// start a HEAT run and are not about the valve preset `valve = true`.
 
 static void boot_applies_anti_cycle_lockout() {
   // A panel restart must not be a licence to start the compressor. The TZT does this too:
@@ -70,26 +72,51 @@ static void valve_never_moves_under_load() {
   assert(c.compressor == false);           // compressor dropped on the mode change...
   assert((o.coils & 0x08) == 0);           // ...bit3 clear...
   assert(c.valve == true);                 // ...and the valve did NOT move (still heat) this tick
-  // valve realigns to the new mode only once the compressor restarts fresh (post-lockout)
+  // the valve moves inside the lockout, with the compressor off; it restarts on the new side
+  c.tick(500000 + VALVE_SETTLE_MS + 1000, true, 0, 0, HOT, true, SP);
   auto o2 = c.tick(500000 + ANTI_CYCLE_MS + 1, true, 0, 0, HOT, true, SP);
   assert(c.compressor == true);
   assert(c.valve == false);                // now cool
   assert((o2.coils & 0x10) == 0);
 }
 
-static void valve_hold_after_heat() {
+static void valve_prepositions_during_lockout() {
+  // switching Heat -> Cool, the valve must reach its new position INSIDE the anti-cycle lockout,
+  // not in the same bus frame that closes the compressor contactor.
   ThermostatController c;
-  c.last_mode = 1;
+  c.last_mode = MODE_HEAT; c.compressor = true; c.valve = true; c.comp_on_at = 1000;
+  const uint32_t sw = 500000;
+  auto o = c.tick(sw, true, MODE_COOL, 0, HOT, true, SP);
+  assert(c.compressor == false && c.valve == true);        // not in the same frame as the stop
+  assert((o.coils & 0x10) != 0);
+  c.tick(sw + VALVE_SETTLE_MS - 1000, true, MODE_COOL, 0, HOT, true, SP);
+  assert(c.valve == true);                                 // still settling
+  auto o2 = c.tick(sw + VALVE_SETTLE_MS + 1000, true, MODE_COOL, 0, HOT, true, SP);
+  assert(c.valve == false && c.compressor == false);       // moved, still locked out
+  assert((o2.coils & 0x10) == 0);
+  // at the restart the valve is already correct -> only the contactor bit changes
+  auto o3 = c.tick(sw + ANTI_CYCLE_MS + 1, true, MODE_COOL, 0, HOT, true, SP);
+  assert(c.compressor == true && c.valve == false);
+  assert((o3.coils & 0x08) != 0 && (o3.coils & 0x10) == 0);
+}
+
+static void valve_hold_after_heat() {
+  // ON in heat-idle the valve stays put for the next call -- past VALVE_HOLD_MS too, and steady tick
+  // after tick. Releasing it while ON lets the pre-position branch re-energise it on the next tick,
+  // toggling the valve every tick. The hold-release is an OFF rule; that side is pinned by
+  // off_switch_ends_heat_call().
+  ThermostatController c;
+  c.last_mode = 1; c.valve = true;
   c.tick(T0, true, 1, 0, COLD, true, SP);                    // heat demand -> compressor + valve
   assert(c.compressor == true && c.valve == true);
   uint32_t t = T0 + MIN_RUN_MS + 1;
   c.tick(t, true, 1, 0, HOT, true, SP);                        // satisfied -> heat call ends
   assert(c.compressor == false);
   assert(c.valve == true);                                     // held right after heat ends
-  c.tick(t + VALVE_HOLD_MS - 1000, true, 1, 0, HOT, true, SP); // still within hold
-  assert(c.valve == true);
-  c.tick(t + VALVE_HOLD_MS + 10000, true, 1, 0, HOT, true, SP);// past hold
-  assert(c.valve == false);
+  for (uint32_t k = 0; k < 6; k++) {                           // past the hold, tick after tick
+    auto o = c.tick(t + VALVE_HOLD_MS + 10000 * (k + 1), true, 1, 0, HOT, true, SP);
+    assert(c.valve == true && (o.coils & COIL_VALVE));
+  }
 }
 
 static void fan_purge() {
@@ -99,7 +126,7 @@ static void fan_purge() {
   auto o = c.tick(2000 + PURGE_MS - 1, false, 0, 0, SP, true, SP);
   assert(c.fan_actual == AF_LOW);
   assert(o.coils == 0x01);                 // fan LOW only (no compressor, no valve)
-  assert(o.r317 == 0);                     // compressor off -> r317 0 even though coils != 0
+  assert(o.r317 == o.r16 + R317_DELTA);    // coils set -> r317 live, even purging while OFF
   auto o2 = c.tick(2000 + PURGE_MS + 1, false, 0, 0, SP, true, SP);
   assert(c.fan_actual == 0 && o2.coils == 0);
 
@@ -118,7 +145,7 @@ static void faux_aux() {
   assert(o.r16 == 90);
   assert(c.compressor == false);                              // ...but the RELAY still tracks real sp
   ThermostatController c2;
-  c2.last_mode = 1;
+  c2.last_mode = 1; c2.valve = true;
   auto o2 = c2.tick(T0, true, 1, 0, COLD, true, SP);        // cold -> compressor on
   assert(o2.r16 == 90);
   assert(c2.compressor == true);
@@ -132,7 +159,7 @@ static void faux_aux() {
 static void r317_formula_and_gate() {
   // HEAT running: r317 = r16-1, riding the faked r16 (89, not the real setpoint)
   ThermostatController c;
-  c.last_mode = 1;
+  c.last_mode = 1; c.valve = true;
   auto o = c.tick(T0, true, 1, 0, COLD, true, SP);
   assert(c.compressor == true);
   assert(o.r16 == 90 && o.r317 == 89);
@@ -142,11 +169,24 @@ static void r317_formula_and_gate() {
   auto o2 = c2.tick(T0, true, 0, 0, HOT, true, SP);
   assert(c2.compressor == true);
   assert(o2.r16 == 64 && o2.r317 == 65);
-  // gate: r317 == 0 during valve-hold (coils non-zero, compressor off)
+  // gate is the COIL BYTE, not compressor demand and not on/off: OFF with the valve still held
+  // leaves coils set, so r317 stays live. The captures never show the real TZT holding coils while
+  // OFF, so this pins OUR choice -- keep the observed coils<->r317 invariant intact.
   ThermostatController c3;
   c3.last_mode = 1; c3.valve = true; c3.heat_call_ended_at = 1000; c3.comp_off_at = 1000;
   auto o3 = c3.tick(1000 + PURGE_MS + 1000, false, 1, 0, SP, true, SP);  // OFF, past purge
-  assert(o3.coils == 0x10 && o3.r317 == 0);
+  assert(o3.coils == 0x10 && o3.r317 == o3.r16 - R317_DELTA);
+  // every coil clear -> 0, the one condition the capture actually establishes
+  ThermostatController c5;
+  c5.last_mode = 1; c5.comp_off_at = 1000;
+  auto o5 = c5.tick(1000 + PURGE_MS + 1000, false, 1, 0, SP, true, SP);  // OFF, no valve held
+  assert(o5.coils == 0 && o5.r317 == 0);
+  // ON but compressor idle (room satisfied): r317 still active (matches raw capture)
+  ThermostatController c4;
+  c4.last_mode = 0;
+  auto o4 = c4.tick(T0, true, 0, 0, SP - 1.0f, true, SP);
+  assert(c4.compressor == false);
+  assert(o4.r16 == 64 && o4.r317 == 65);
 }
 
 static void coil_assembly() {
@@ -154,7 +194,7 @@ static void coil_assembly() {
   // AF_HIGH_UP and the dwell has long expired at T0, so AUTO bands straight to HIGH. The
   // MED floor path (band < AF_MED while the compressor runs) is covered separately below.
   ThermostatController c;
-  c.last_mode = 1;
+  c.last_mode = 1; c.valve = true;
   auto o = c.tick(T0, true, 1, 0, COLD, true, SP);
   assert(o.coils == (0x08 | 0x10 | 0x04));    // comp | valve | fan HIGH
 }
@@ -188,7 +228,7 @@ static void cutout_hysteresis() {
   h2.tick(T, true, 1, 2, SP + 0.1f, true, SP);
   assert(h2.compressor == true);
   // turn-on edge unchanged at HYST_ON: starts only once HYST_ON below setpoint
-  ThermostatController h3; h3.last_mode = 1; h3.compressor = false;
+  ThermostatController h3; h3.last_mode = 1; h3.compressor = false; h3.valve = true;
   h3.tick(T, true, 1, 2, SP - 0.4f, true, SP);           // 0.4 below (< HYST_ON) -> still off
   assert(h3.compressor == false);
   h3.tick(T, true, 1, 2, SP - (HYST_ON + 0.05f), true, SP);
@@ -198,7 +238,7 @@ static void cutout_hysteresis() {
 static void auto_changeover() {
   const uint32_t T = 10000000;
   // AUTO picks HEAT when clearly cold (room < sp - DEADBAND)
-  ThermostatController h; h.last_mode = MODE_HEAT; h.auto_dir = MODE_HEAT;
+  ThermostatController h; h.last_mode = MODE_HEAT; h.auto_dir = MODE_HEAT; h.valve = true;
   auto oh = h.tick(T, true, MODE_AUTO, 2, SP - 2.0f, true, SP);
   assert(h.auto_dir == MODE_HEAT && oh.r1 == 2 && h.compressor == true);
   // AUTO picks COOL when clearly hot (room > sp + DEADBAND)
@@ -214,15 +254,42 @@ static void auto_changeover() {
   ThermostatController f; f.last_mode = MODE_HEAT; f.auto_dir = MODE_HEAT; f.was_on = true;
   f.tick(T, true, MODE_AUTO, 2, SP + DEADBAND_C + 0.1f, true, SP);
   assert(f.auto_dir == MODE_COOL);
-  // blind AUTO can't pick a direction -> idle (never blindly runs)
+  // blind AUTO with no reading ever seen -> idle: auto_dir's initialiser is a guess, not a choice
   ThermostatController b; b.last_mode = MODE_COOL; b.auto_dir = MODE_COOL;
   b.tick(T, true, MODE_AUTO, 2, 0.0f, false, SP);
   assert(b.compressor == false);
-  // a changeover is a mode change: drops the compressor + starts the lockout
+  // blind AUTO that HAS picked a direction rides it: idling would be unrecoverable from the wall,
+  // which has no mode selector, so losing the reading would silently stop conditioning the room.
+  ThermostatController r; r.last_mode = MODE_HEAT; r.auto_dir = MODE_HEAT;
+  r.tick(T, true, MODE_AUTO, 2, SP - 2.0f, true, SP);        // a real reading picks HEAT
+  assert(r.auto_dir_known == true);
+  // probe past MIN_RUN_MS: inside it the compressor is held on by oil-return regardless, which
+  // would pass whether or not the blind fallback exists.
+  auto orr = r.tick(T + MIN_RUN_MS + 1000, true, MODE_AUTO, 2, 0.0f, false, SP);   // reading lost
+  assert(r.compressor == true && orr.r1 == R1_HEAT);
+  // a changeover waits for the run to end: past the dead band the old direction's own cut-out stops it
+  // (min-run long met here), and the flip lands on the next tick
   ThermostatController s; s.last_mode = MODE_HEAT; s.auto_dir = MODE_HEAT; s.was_on = true;
-  s.compressor = true; s.comp_on_at = 1;
+  s.compressor = true; s.comp_on_at = 1; s.valve = true;
   s.tick(T, true, MODE_AUTO, 2, SP + 2.0f, true, SP);
-  assert(s.auto_dir == MODE_COOL && s.compressor == false && s.comp_off_at == T);
+  assert(s.auto_dir == MODE_HEAT && s.compressor == false && s.comp_off_at == T);
+  s.tick(T + 10000, true, MODE_AUTO, 2, SP + 2.0f, true, SP);
+  assert(s.auto_dir == MODE_COOL);
+}
+
+// Dragging the setpoint across the room in AUTO must not cut a fresh run short of MIN_RUN_MS: a
+// changeover flip is a mode change, so it has to wait for the run to end.
+static void auto_changeover_respects_min_run() {
+  const float FAR = SP - 2.0f - DEADBAND_C - 0.5f;           // setpoint dragged well below the room
+  ThermostatController c; c.last_mode = MODE_HEAT; c.auto_dir = MODE_HEAT; c.was_on = true; c.valve = true;
+  c.tick(T0, true, MODE_AUTO, 0, SP - 2.0f, true, SP);       // AUTO heat run starts
+  assert(c.compressor);
+  c.tick(T0 + 10000, true, MODE_AUTO, 0, SP - 2.0f, true, FAR);
+  assert(c.compressor && c.auto_dir == MODE_HEAT);           // held for oil return, no flip
+  c.tick(T0 + MIN_RUN_MS + 1000, true, MODE_AUTO, 0, SP - 2.0f, true, FAR);
+  assert(!c.compressor);                                     // ends on HEAT's own cut-out
+  c.tick(T0 + MIN_RUN_MS + 11000, true, MODE_AUTO, 0, SP - 2.0f, true, FAR);
+  assert(c.auto_dir == MODE_COOL);                           // flips once idle
 }
 
 // Turning on in AUTO must CHOOSE a direction, not inherit auto_dir's initialiser (COOL) whenever
@@ -265,9 +332,9 @@ static void degraded_modes() {
   ThermostatController c;
   auto o = c.tick(0, false, 0, 0, SP, false, SP);
   assert(c.compressor == false && o.coils == 0 && o.r1 == 0 && o.r2 == 0);
-  // blind (no room reading) ON in AUTO -> MED fan default, but AUTO can't pick a direction
-  // blind so it idles (see auto_changeover's blind case for the compressor side of this; this
-  // was previously mis-coded with mode=COOL, which tests manual-blind-forces-on instead of AUTO).
+  // blind (no room reading) ON in AUTO -> MED fan default; idles here only because no reading
+  // has ever picked a direction (see auto_changeover for the case where one has). The mode must
+  // be AUTO: COOL would test manual-blind-forces-on instead.
   ThermostatController c2;
   c2.last_mode = MODE_COOL;
   auto o2 = c2.tick(1000, true, MODE_AUTO, 0, 0.0f, false, SP);
@@ -280,7 +347,7 @@ static void manual_fan_bypasses_floor() {
   // AUTO fan floors to MED while the compressor runs (coil_assembly). MANUAL fan must NOT:
   // a user picking LOW should get LOW even with the compressor on.
   ThermostatController c;
-  c.last_mode = 1;
+  c.last_mode = 1; c.valve = true;
   auto o = c.tick(T0, true, 1, 1, COLD, true, SP);   // HEAT, fan_sel=LOW, cold -> compressor on
   assert(c.compressor == true);
   assert(c.fan_actual == AF_LOW);
@@ -288,20 +355,24 @@ static void manual_fan_bypasses_floor() {
 }
 
 static void registers_r9_r354() {
+  // r9 is the speed the fan relays drive, never 4: the real TZT's r9 always matched its fan coil,
+  // and its r9 = 4 appears in a single capture sample.
   ThermostatController c;
   c.last_mode = 0;
-  auto o = c.tick(1000, true, 0, 0, 12.34f, true, SP); // fan_sel=0 -> AUTO code
-  assert(o.r9 == R9_AUTO);
+  auto o = c.tick(1000, true, 0, 0, 12.34f, true, SP); // fan_sel=0 -> AUTO: overcooled, bands LOW
+  assert(o.r9 == (uint16_t) c.fan_actual && o.r9 == AF_LOW);
   assert(o.r354 == (uint16_t) lroundf(12.34f * R354_SCALE));
   auto o2 = c.tick(1000, true, 0, 2, 12.34f, true, SP); // fan_sel=2 -> passthrough
   assert(o2.r9 == 2);
+  auto o3 = c.tick(2000, false, 0, 0, 12.34f, true, SP); // OFF in AUTO -> AUTO's last speed
+  assert(o3.r9 == AF_LOW);
 }
 
 static void off_switch_ends_heat_call() {
   // Flipping OFF mid heat-call (distinct from the hysteresis-satisfied stop) must also start
   // the valve hold: heat_call_ended_at gets set from the `!on` branch, not just on demand-drop.
   ThermostatController c;
-  c.last_mode = 1;
+  c.last_mode = 1; c.valve = true;
   c.tick(T0, true, 1, 0, COLD, true, SP);                     // heat call -> compressor + valve on
   assert(c.compressor == true && c.valve == true);
   uint32_t t = T0 + MIN_RUN_MS + 1;
@@ -336,10 +407,9 @@ static void millis_wrap_safe() {
 }
 
 static void manual_blind_forces_on() {
-  // blind (room_ok=false) in a MANUAL mode must run unconditionally: "ON means ON", unlike AUTO
-  // which idles blind (see degraded_modes). Covers both manual branches since the guard is
-  // `mode != MODE_AUTO`, mode-agnostic.
-  ThermostatController h; h.last_mode = 1;
+  // blind (room_ok=false) in a MANUAL mode must run unconditionally: "ON means ON" with no
+  // reading needed, unlike AUTO which needs a direction picked first (see auto_changeover).
+  ThermostatController h; h.last_mode = 1; h.valve = true;
   auto oh = h.tick(T0, true, 1, 0, 0.0f, false, SP);   // HEAT, blind
   assert(h.compressor == true);
   assert((oh.coils & 0x08) != 0);
@@ -375,6 +445,55 @@ static void mode_switch_while_idle_no_valve_retrigger() {
   assert(c.last_mode == MODE_COOL);
   assert(c.heat_call_ended_at == 500);              // untouched: compressor was already off
   assert(c.valve == true);                          // still holding from the earlier heat call
+}
+
+// The contactor never closes in the tick the valve moves. After a long idle -- the first heat start of
+// the day, an AUTO flip, a mode change -- the valve moves first and the compressor waits
+// VALVE_SETTLE_MS. The real TZT went valve-first in all three starts captured.
+static void valve_moves_before_compressor() {
+  const uint32_t T = 10000000;
+  ThermostatController c; c.last_mode = MODE_HEAT;            // valve in the cool position, long idle
+  auto o = c.tick(T, true, MODE_HEAT, 0, COLD, true, SP);     // morning: on, cold room
+  assert(c.valve && !c.compressor && (o.coils & COIL_VALVE) && !(o.coils & COIL_COMPRESSOR));
+  c.tick(T + VALVE_SETTLE_MS - 1000, true, MODE_HEAT, 0, COLD, true, SP);
+  assert(!c.compressor);                                      // valve still settling
+  auto o2 = c.tick(T + VALVE_SETTLE_MS + 1000, true, MODE_HEAT, 0, COLD, true, SP);
+  assert(c.compressor && (o2.coils & COIL_COMPRESSOR) && (o2.coils & COIL_VALVE));
+
+  // AUTO flip after a long heat-idle: no tick may change the valve and the compressor together
+  ThermostatController a; a.last_mode = MODE_HEAT; a.auto_dir = MODE_HEAT; a.was_on = true; a.valve = true;
+  uint8_t prev = a.tick(T, true, MODE_AUTO, 0, SP + 1.0f, true, SP).coils;      // idle inside the band
+  for (uint32_t k = 1; k <= 30; k++) {                        // the room warms past it; 10 s ticks
+    uint8_t now_c = a.tick(T + 10000 * k, true, MODE_AUTO, 0, SP + DEADBAND_C + 1.0f, true, SP).coils;
+    assert(!((prev ^ now_c) & COIL_VALVE) || !((prev ^ now_c) & COIL_COMPRESSOR));
+    prev = now_c;
+  }
+  assert(a.compressor && !a.valve);                           // and it did end up cooling
+}
+
+// Entering AUTO while a manual run is going must carry on in that direction, not act on whatever
+// auto_dir an earlier AUTO session left: inside the dead band that would drop a cooling run to "heat"
+// a warm room, and past it -- flips being held to between runs -- it would drop the run into a lockout.
+static void auto_entered_while_running_keeps_direction() {
+  const float rooms[] = {SP + 1.0f, SP + DEADBAND_C + 0.5f};  // inside the dead band, and past it
+  for (float room : rooms) {
+    ThermostatController c; c.auto_dir = MODE_HEAT; c.was_on = true;   // stale HEAT from an earlier session
+    c.tick(T0, true, MODE_COOL, 0, SP + 2.0f, true, SP);      // manual COOL run starts
+    assert(c.compressor);
+    c.tick(T0 + 10000, true, MODE_AUTO, 0, room, true, SP);   // switched to AUTO mid-run
+    assert(c.compressor && c.auto_dir == MODE_COOL && c.comp_off_at != T0 + 10000);
+  }
+}
+
+// Overshoot is no demand: AUTO fan must not speed up on the satisfied side of the setpoint. Banding on
+// |room - setpoint| would drive MED in a heat-idle room more than AF_MED_UP above the setpoint.
+static void auto_fan_ignores_overshoot() {
+  ThermostatController h; h.last_mode = MODE_HEAT; h.auto_fan = AF_LOW;
+  h.tick(10000000, true, MODE_HEAT, 0, SP + AF_MED_UP + 0.2f, true, SP);   // too warm, heat idle
+  assert(!h.compressor && h.fan_actual == AF_LOW);
+  ThermostatController c; c.last_mode = MODE_COOL; c.auto_fan = AF_LOW;
+  c.tick(10000000, true, MODE_COOL, 0, SP - AF_MED_UP - 0.2f, true, SP);   // too cold, cool idle
+  assert(!c.compressor && c.fan_actual == AF_LOW);
 }
 
 static void mode_change_while_off_updates_last_mode() {
@@ -428,6 +547,7 @@ int main() {
   anti_short_cycle();
   min_run_time();
   valve_never_moves_under_load();
+  valve_prepositions_during_lockout();
   valve_hold_after_heat();
   fan_purge();
   faux_aux();
@@ -436,6 +556,7 @@ int main() {
   auto_fan_floors_to_med_under_compressor_load();
   cutout_hysteresis();
   auto_changeover();
+  auto_changeover_respects_min_run();
   auto_seeds_on_turn_on();
   degraded_modes();
   manual_fan_bypasses_floor();
@@ -447,5 +568,8 @@ int main() {
   auto_deadband_exact_boundary_holds();
   mode_switch_while_idle_no_valve_retrigger();
   mode_change_while_off_updates_last_mode();
+  valve_moves_before_compressor();
+  auto_entered_while_running_keeps_direction();
+  auto_fan_ignores_overshoot();
   return 0;
 }

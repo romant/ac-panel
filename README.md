@@ -29,7 +29,7 @@ fan low, fan medium, fan high, compressor, reversing valve.
 | Register | Meaning | Encoding |
 |---|---|---|
 | r1 | Mode | `0` off · `2` heat · `3` cool |
-| r9 | Fan | `1` low · `2` med · `3` high · `4` auto |
+| r9 | Fan | `1` low · `2` med · `3` high |
 | r16 | Setpoint | `°C = r16 / 2 − 10` |
 | r354 | Room temperature | `°C = r354 / 50` |
 
@@ -51,15 +51,16 @@ claim, damages, equipment failure, injury, or other liability arising from its
 use. Sections 7 and 8 of the [LICENSE](LICENSE) carry this as an operative term
 of the grant.
 
-Replacing the thermostat moves compressor protection into your code. **Nothing downstream will
-catch a mistake.**
+Replacing the thermostat moves compressor protection into your code. **Do not rely on anything
+downstream to catch a mistake.** The UC8's manual documents its own compressor timers, but their
+values are unknown here and may be zero.
 
 On the TZT-100, the compressor restart delay and minimum run time are DIP switches on the
 thermostat itself — not settings in the air conditioner. Unplug the thermostat and those
 protections leave with it. A replacement that short-cycles the compressor, or swings the reversing
 valve while the compressor is loaded, will damage equipment.
 
-The timing constants in `include/ac_control.h` are inherited from the DIP settings of one
+The compressor timings in `include/ac_control.h` are inherited from the DIP settings of one
 particular unit. **They are not a specification of your unit.** Read
 [the protection section](docs/protocol.md#compressor-protection-is-the-thermostats-job) before
 using them.

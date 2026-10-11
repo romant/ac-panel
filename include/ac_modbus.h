@@ -18,9 +18,9 @@ constexpr size_t   MB_REQ_LEN         = 8;       // addr + fc + start(2) + qty(2
 constexpr uint16_t MB_MAX_REGS  = 120;   // 120*2+5 = 245, inside MB_REPLY_MAX
 constexpr uint16_t MB_MAX_COILS = 200;
 constexpr size_t   MB_REPLY_MAX = 253;   // largest RTU frame we will build
-// Cap the RX buffer so traffic for OTHER addresses cannot grow it without bound.
-// Keeping the last MB_REQ_LEN bytes preserves a request that is mid-arrival.
-constexpr size_t   MB_RX_MAX    = 256;
+// No poll answered for this long = the bus is down. The master reads every block about once a
+// second, so this is several missed cycles, not one slow reply.
+constexpr uint32_t MB_ALIVE_MS  = 5000;
 
 inline uint16_t modbus_crc(const uint8_t *d, size_t n) {
   uint16_t crc = MB_CRC_INIT;
@@ -72,7 +72,8 @@ inline size_t modbus_build_reply(const uint8_t *req, const std::map<uint16_t, ui
 //
 // Only ONE request is answered per call, and the rest of the buffer is then dropped: those
 // bytes are the master's traffic to other slaves, and keeping them risks a false CRC match
-// across a frame boundary.
+// across a frame boundary. Without a reply, the scan consumes everything but a tail too short
+// to be a request, so traffic for other addresses can never grow the buffer.
 inline size_t modbus_poll(std::vector<uint8_t> &buf, const std::map<uint16_t, uint16_t> &regs,
                           uint8_t coils, uint8_t *out) {
   size_t i = 0;
@@ -90,6 +91,5 @@ inline size_t modbus_poll(std::vector<uint8_t> &buf, const std::map<uint16_t, ui
     i++;                                  // not ours, or bad CRC -> resync one byte
   }
   if (i) buf.erase(buf.begin(), buf.begin() + i);
-  if (buf.size() > MB_RX_MAX) buf.erase(buf.begin(), buf.end() - MB_REQ_LEN);
   return 0;
 }

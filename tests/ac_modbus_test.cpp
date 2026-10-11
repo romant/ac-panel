@@ -144,14 +144,15 @@ static void poll_ignores_other_addresses_and_bad_crc() {
   assert(modbus_poll(buf, regs, 0, out) == 0);
 }
 
-// A bus full of traffic we never answer must not grow the buffer without bound.
+// A bus full of traffic we never answer must not grow the buffer: each poll keeps only a tail too
+// short to be a request.
 static void rx_buffer_is_capped() {
   std::map<uint16_t, uint16_t> regs;            // serve nothing -> never replies, never clears
   uint8_t out[MB_REPLY_MAX];
   std::vector<uint8_t> buf;
-  for (size_t k = 0; k < MB_RX_MAX * 3; k++) buf.push_back((uint8_t) (k & 0xFF));
+  for (size_t k = 0; k < 768; k++) buf.push_back((uint8_t) (k & 0xFF));
   assert(modbus_poll(buf, regs, 0, out) == 0);
-  assert(buf.size() <= MB_RX_MAX);
+  assert(buf.size() < MB_REQ_LEN);
 }
 
 int main() {

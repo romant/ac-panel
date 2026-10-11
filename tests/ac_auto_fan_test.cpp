@@ -40,6 +40,12 @@ int main() {
   lc = T - AF_DWELL_MS;
   assert(auto_fan_speed(AF_HIGH_UP + 1.0f, AF_MED, T, &lc, AF_DWELL_MS) == AF_HIGH);
 
+  // fresh boot: last_change 0 = never changed, so the band must be free to move immediately
+  lc = 0; assert(auto_fan_speed(AF_HIGH_UP + 1.0f, AF_MED, 1000, &lc, AF_DWELL_MS) == AF_HIGH);
+  assert(lc == 1000);
+  // ...but a real change moments earlier still blocks (the dwell itself is intact)
+  lc = 1000; assert(auto_fan_speed(AF_HIGH_UP + 1.0f, AF_MED, 2000, &lc, AF_DWELL_MS) == AF_MED);
+
   // *last_change is untouched on a hold (no state change), and stamped to `now` on a change
   lc = 12345; auto_fan_speed((AF_MED_UP + AF_HIGH_UP) * 0.5f, AF_MED, T, &lc, AF_DWELL_MS); assert(lc == 12345);
   lc = 0;     auto_fan_speed(AF_MED_UP,        AF_LOW, T, &lc, AF_DWELL_MS); assert(lc == T);

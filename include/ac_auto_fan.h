@@ -1,7 +1,8 @@
 #pragma once
 #include <cstdint>
 
-// AUTO fan speed banding on the error e = |room - setpoint|, in degrees C.
+// AUTO fan speed banding on the error e: how far the room is short of the setpoint in the
+// direction being driven, in degrees C (0 once past it -- an overshoot is no demand).
 // Each band has a separate rising and falling edge so the speed cannot chatter,
 // and a dwell time because these are physical relays.
 constexpr float AF_MED_UP   = 1.0f;   // LOW  -> MED
@@ -26,6 +27,7 @@ inline int auto_fan_speed(float e, int cur, uint32_t now, uint32_t *last_change,
     if (e < AF_MED_DN)       t = AF_LOW;
     else if (e < AF_HIGH_DN) t = AF_MED;
   }
-  if (t != cur && (now - *last_change) >= dwell_ms) { *last_change = now; return t; }
+  // *last_change == 0 means the speed has NEVER changed, not that it just did.
+  if (t != cur && (*last_change == 0 || (now - *last_change) >= dwell_ms)) { *last_change = now; return t; }
   return cur;
 }

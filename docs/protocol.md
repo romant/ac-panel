@@ -19,7 +19,7 @@ the unit end, and none of this page applies to it.
 | Line | 19200 baud, 8 data bits, **even** parity, 1 stop bit |
 | Master | The UC8 indoor unit controller |
 | Slave | The TZT-100, at **address 7** |
-| Poll tick | ~16 ms |
+| Poll cycle | About once a second: a burst of six reads, then ~0.85 s of quiet |
 | Response timeout | ~36 ms |
 
 At the TZT's backplate the pair is labelled `Coms B` / `Coms A`; on the unit here they are the
@@ -91,9 +91,9 @@ best available health signal.
 |---|---|---|
 | **r1** | Mode | `0` off · `2` heat · `3` cool · `4` seen but unidentified |
 | **r2** | On/off | `1` = running |
-| **r9** | Fan setting | `1` low · `2` med · `3` high · `4` auto |
+| **r9** | Fan speed | `1` low · `2` med · `3` high — the speed the fan relays drive · `4` seen once, unconfirmed |
 | **r16** | Setpoint | `°C = r16 / 2 − 10` — 0.5 °C steps |
-| **r317** | Setpoint ∓ 0.5 °C | `heat: r16 − 1` · `cool: r16 + 1` · `0` when the coils are clear |
+| **r317** | Setpoint ∓ 0.5 °C | `heat: r16 − 1` · `cool: r16 + 1` · `0` if and only if every coil is clear |
 | **r354** | Room temperature | `°C = r354 / 50` |
 | r353 | A second temperature, ÷50 | Coil or outdoor; unidentified |
 | r14, r15, r19, r50, r54 | Static here | `62`, `111`, `78`, `0`, `235` |
@@ -101,6 +101,14 @@ best available health signal.
 
 The room temperature is on the bus because the UC8 has no room sensor of its own and reports room
 temperature onward to a BMS. It must be told.
+
+**r317 is gated on the coil byte.** Across both captures, 155 samples with every coil clear read
+`0`, and 1,787 with any coil set read the formula; no sample with a coil set reads `0`, and none
+with every coil clear reads anything else. It does not follow compressor demand: 834 samples have
+the compressor clear and only fan or valve bits set, and r317 is never `0` in one of them. Nor
+does it follow r2: 70 samples with the unit on and every coil clear — the start-up delay just
+after r2 rises — read `0`. The only misses are 34 samples just after a mode change, still carrying
+the previous mode's formula.
 
 ## Coils — the five relay outputs
 
@@ -139,27 +147,39 @@ setpoint (r16). That comparison is the control loop a replacement device must ow
 
 ## Compressor protection is the thermostat's job
 
-The coils are the thermostat's outputs, so the protection timings are enforced by the thermostat,
-not by the unit controller. On the TZT-100 they are DIP switches: `Sw5` sets the compressor
-restart delay, `Sw7` the minimum run time. **Replacing the thermostat transfers this
-responsibility, and nothing downstream will catch a mistake.**
+The coils are the thermostat's outputs, so the protection timings are enforced by the thermostat.
+On the TZT-100 they are DIP switches: `Sw5` sets the compressor restart delay, `Sw7` the minimum
+run time. **Replacing the thermostat transfers this responsibility.**
 
-⚠️ Do not assume the UC8 protects the compressor. That is unverified.
+⚠️ The UC8 has protection of its own, with values nobody here knows. Its manual documents minimum
+on-off, off-on and on-on times and heat/cool changeover hold-offs (registers 201–203, 215/216),
+applied "independent of the request of a thermostat and/or a BMS"; the TZT manual says its own timer
+"will work in parallel with the Anti-Rapid Cycle Timer in the Air Conditioner's internal controls".
+The values are readable only on the UC8's BMS port and may be zero, so do not rely on them: the
+thermostat's own timers are the floor you can vouch for.
 
 Three hazards a replacement must handle:
 
 1. **Short-cycling.** Any stop — setpoint satisfied, powered off, or mode changed — must start a
    lockout before the compressor coil may be set again.
 2. **Oil return.** Once started, the compressor must run for a minimum time even if the setpoint
-   is immediately satisfied.
-3. **Reversing valve under load.** Bit 4 must never move while bit 3 is set. The installer manual
-   also requires the valve to stay energised for 120 minutes after a heating call ends, to avoid a
-   decompression hiss and the wear that comes with it.
+   is immediately satisfied. An automatic heat/cool changeover is a mode change, so it waits for
+   the run to end. An explicit mode change or power-off still ends it at once, as the real
+   thermostat did: one captured heat run ended after 58 s on a mode change, another after 86 s when
+   its override expired.
+3. **Reversing valve under load.** Bit 4 must never move while bit 3 is set, and it moves first:
+   the real thermostat set the valve before the compressor in all three starts captured. The
+   reference implementation moves the valve only while the compressor is off, at least
+   `VALVE_SETTLE_MS` after the stop, and holds any start until the valve has sat in position for
+   `VALVE_SETTLE_MS`. The installer manual also requires the valve to stay energised for 120 minutes
+   after a heating call ends, to avoid a decompression hiss and the wear that comes with it. The
+   implementation releases it after `VALVE_HOLD_MS` only while off; while on, the valve stays in
+   position for the next call.
 
-The values in [`../include/ac_control.h`](../include/ac_control.h) are inherited from the DIP
-switch settings on the unit they were taken from, and match restart intervals of roughly four
-minutes measured on that unit. **The compressor's actual requirement is a specification of your
-unit, not of this protocol.** Treat them as conservative starting points.
+The compressor timings in [`../include/ac_control.h`](../include/ac_control.h) are inherited from
+the DIP switch settings on the unit they were taken from, and match restart intervals of roughly
+four minutes measured on that unit. **The compressor's actual requirement is a specification of
+your unit, not of this protocol.** Treat them as conservative starting points.
 
 ## There is no auxiliary heat relay
 
@@ -173,8 +193,8 @@ trip. It has no signature on the bus and, with `Sw1` on, no hardware output behi
 
 ## Deliberate deviations in this implementation
 
-One register where the reference implementation knowingly serves something the real thermostat
-would not:
+Two places where the reference implementation knowingly serves something the real thermostat was
+never seen to serve:
 
 **r16 in heat mode** is published as `FAUX_AUX_C` (35 °C) rather than the user's setpoint, to open
 a large setpoint-to-room gap in the hope that the inverter reads it as a request for maximum
@@ -186,6 +206,14 @@ the same value.
 does not, this is a harmless no-op. If it does, the only thing bounding the result is the
 compressor cut-out, which the thermostat owns. Cooling is honest — the real setpoint is published.
 
+**Coils while off.** After a stop the fan runs on low for `PURGE_MS` (AUTO fan only) to purge
+residual coil heat, and after a heating call the reversing valve stays energised for
+`VALVE_HOLD_MS` — the installer manual says the valve stays energised after the thermostat is
+turned off. Outside two transition samples, the captures never show the real thermostat with
+`r1 = 0` and coils set, so the unit controller's response to it is unobserved. Because r317 is
+gated on the coil byte, it stays live in this state too. That keeps the observed coils ↔ r317
+relationship intact, but it is a choice, not evidence.
+
 ## Not established
 
 - **What r317 is for.** Its arithmetic is solid across three setpoints and both modes. Its meaning
@@ -196,8 +224,10 @@ compressor cut-out, which the thermostat owns. Cooling is honest — the real se
 - **Whether the unit acts on r1 or r16 at all.** The coils fully specify the actions, so mode and
   setpoint are redundant for control. Defrost scheduling and inverter capacity modulation are
   plausible and untested.
-- **r9 = 4.** Seen while cycling the fan control, assumed to be auto. Unconfirmed against the
-  screen.
+- **r9 = 4.** One sample across both captures, mid fan-button cycle. Likely the thermostat's
+  *Auto Fan*, which cycles the fan with the call rather than choosing a speed. Unconfirmed against
+  the screen. The reference implementation never serves it: its r9 is always the speed the fan
+  relays drive, as the real thermostat's r9 always matched its fan coil.
 - **r353.** A temperature, ÷50, around 12.5 °C in the observed captures. Coil or outdoor, unknown.
 - **r14 / r15 / r19 / r50 / r54.** Never observed changing. Whether they are genuinely constant or
   merely untouched is unknown.

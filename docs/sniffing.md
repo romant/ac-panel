@@ -70,7 +70,9 @@ what any register means.
 
 ## Reading a capture
 
-The master polls on a ~16 ms tick with a ~36 ms response timeout. A healthy dialogue starts:
+The master reads every block about once a second — a burst of six reads, then quiet — with a
+~36 ms response timeout. ⚠️ The dongle (an FT232) delivers every USB read on a 16 ms grid, its
+latency timer, so a capture cannot resolve intervals finer than that. A healthy dialogue starts:
 
 ```
 REQ  07 03 00 0F 00 05 B5 AC                          master reads reg 15
